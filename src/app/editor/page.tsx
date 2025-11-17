@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useRef, useEffect } from 'react';
+import { useState, useRef, useEffect, useCallback } from 'react';
 import dynamic from 'next/dynamic';
 import { CommandInput } from '@/components/editor/CommandInput';
 import { useEditorStore } from '@/lib/stores/editorStore';
@@ -14,8 +14,25 @@ const Viewport3D = dynamic(
 
 export default function EditorPage() {
   const [output, setOutput] = useState<string[]>([]);
+  const [isAIProcessing, setIsAIProcessing] = useState(false);
+  const [threadId, setThreadId] = useState<string | null>(null);
+  const [pendingPlan, setPendingPlan] = useState<{ summary: string; steps: string[]; timestamp: number } | null>(null);
+  const [conversationHistory, setConversationHistory] = useState<Array<{ role: 'user' | 'assistant'; content: string }>>([]);
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const { nodes, lines, gridSize, showAxisLabels, showNodes, showLineLabels, addNode, addLine, removeLine, removeNode, clear, setGridSize, setShowAxisLabels, setShowNodes, setShowLineLabels, loadProject, undo, redo, canUndo, canRedo, saveHistory } = useEditorStore();
+  const abortControllerRef = useRef<AbortController | null>(null);
+
+  // Debug: Log when pendingPlan changes
+  useEffect(() => {
+    console.log('🎯 [BANNER DEBUG] pendingPlan changed:', pendingPlan);
+    if (pendingPlan) {
+      console.log('✅ [BANNER DEBUG] Banner SHOULD be visible now with timestamp:', pendingPlan.timestamp);
+      console.log('✅ [BANNER DEBUG] Summary:', pendingPlan.summary);
+      console.log('✅ [BANNER DEBUG] Steps count:', pendingPlan.steps.length);
+    } else {
+      console.log('❌ [BANNER DEBUG] Banner should be hidden (pendingPlan is null)');
+    }
+  }, [pendingPlan]);
+  const { nodes, lines, gridSize, showAxisLabels, showNodes, showLineLabels, is2DMode, addNode, addLine, removeLine, removeNode, clear, setGridSize, setShowAxisLabels, setShowNodes, setShowLineLabels, set2DMode, loadProject, undo, redo, canUndo, canRedo, saveHistory } = useEditorStore();
 
   // Keyboard shortcuts for undo/redo
   useEffect(() => {
@@ -36,6 +53,47 @@ export default function EditorPage() {
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [undo, redo, canUndo, canRedo]);
+
+  // Keyboard shortcuts for plan approval - using direct reference to avoid stale closures
+  useEffect(() => {
+    if (!pendingPlan) {
+      console.log('⌨️ [KEYBOARD] No pending plan, keyboard shortcuts disabled');
+      return;
+    }
+
+    console.log('⌨️ [KEYBOARD] Keyboard shortcuts enabled for plan:', pendingPlan.timestamp);
+
+    const handleKeyDown = (e: KeyboardEvent) => {
+      // Ignore if typing in input
+      if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) {
+        return;
+      }
+
+      if (e.key === 'Enter' || e.key === 'y' || e.key === 'Y') {
+        e.preventDefault();
+        console.log('⌨️ [KEYBOARD] Y/Enter key pressed - triggering approval');
+        // Find and click the approval button to use the same handler
+        const approveButton = document.querySelector('[data-action="approve"]') as HTMLButtonElement;
+        if (approveButton) {
+          approveButton.click();
+        }
+      } else if (e.key === 'Escape' || e.key === 'n' || e.key === 'N') {
+        e.preventDefault();
+        console.log('⌨️ [KEYBOARD] N/Esc key pressed - triggering rejection');
+        // Find and click the rejection button to use the same handler
+        const rejectButton = document.querySelector('[data-action="reject"]') as HTMLButtonElement;
+        if (rejectButton) {
+          rejectButton.click();
+        }
+      }
+    };
+
+    window.addEventListener('keydown', handleKeyDown);
+    return () => {
+      console.log('⌨️ [KEYBOARD] Removing keyboard shortcuts');
+      window.removeEventListener('keydown', handleKeyDown);
+    };
+  }, [pendingPlan]);
 
   const handleSave = () => {
     const timestamp = new Date().toISOString().replace(/:/g, '-').split('.')[0];
@@ -65,14 +123,261 @@ export default function EditorPage() {
     }
   };
 
-  const handleCommand = (command: string) => {
+  // Detect if input is a command or natural language
+  const isCommand = (input: string): boolean => {
+    const trimmed = input.trim();
+    const lowerInput = trimmed.toLowerCase();
+
+    // Known command patterns
+    const commandPatterns = [
+      /^n\d*\[/i,           // N[x,y,z] or N1[x,y,z]
+      /^l\d*\[/i,           // L[1,2] or L1[N1,N2]
+      /^split\s+/i,         // split L1 3
+      /^intersect\s+/i,     // intersect N1 N2 L1
+      /^del(ete)?\s+/i,     // del N1 or delete L1
+      /^(list|ls)$/i,       // list or ls
+      /^clear$/i,           // clear
+      /^grid\s+/i,          // grid 20
+      /^grid$/i,            // grid
+      /^axis$/i,            // axis
+      /^nodes$/i,           // nodes
+      /^lines$/i,           // lines
+      /^(help|\?)$/i,       // help or ?
+    ];
+
+    // Also check for simple node/line info queries
+    if (/^[NL]\d+$/i.test(trimmed)) {
+      return true;
+    }
+
+    return commandPatterns.some(pattern => pattern.test(trimmed));
+  };
+
+  // Handle AI assistant
+  const handleAIRequest = async (input: string) => {
+    // Create new abort controller for this request
+    abortControllerRef.current = new AbortController();
+
+    setIsAIProcessing(true);
+    setOutput((prev) => [...prev, `🤖 AI: ${input}`]);
+
+    // Add user message to conversation history
+    const updatedHistory = [...conversationHistory, { role: 'user' as const, content: input }];
+    setConversationHistory(updatedHistory);
+
+    try {
+      // Convert state to simple format
+      const state = {
+        nodes: Array.from(nodes.values()).map((n) => ({
+          name: n.name,
+          x: n.x,
+          y: n.y,
+          z: n.z,
+        })),
+        lines: Array.from(lines.values()).map((l) => ({
+          name: l.name,
+          node1: l.node1.name,
+          node2: l.node2.name,
+        })),
+        is2DMode,
+      };
+
+      const response = await fetch('/api/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          message: input,
+          state,
+          threadId,
+          conversationHistory: updatedHistory,
+        }),
+        signal: abortControllerRef.current.signal,
+      });
+
+      if (!response.ok) {
+        throw new Error('Failed to get response from AI');
+      }
+
+      const data = await response.json();
+
+      // Update thread ID
+      if (data.threadId) {
+        setThreadId(data.threadId);
+      }
+
+      // Check if there's an APPROVED plan from reviewPlan tool that needs user confirmation
+      console.log('🔍 [PLAN CHECK] Checking for plan in toolResults:', data.toolResults);
+
+      // Look for reviewPlan result with approved=true
+      const reviewResult = data.toolResults?.find((r: any) => r.approved === true && r.plan);
+
+      // Fallback: if no review result, look for createPlan result (for backwards compatibility)
+      const planResult = reviewResult || data.toolResults?.find((r: any) => r.plan?.needsConfirmation);
+
+      console.log('📋 [PLAN CHECK] Review result:', reviewResult);
+      console.log('📋 [PLAN CHECK] Plan result found:', planResult);
+
+      if (planResult?.plan) {
+        const timestamp = Date.now();
+        console.log('✅ [PLAN CHECK] Setting pending plan with timestamp:', timestamp);
+        console.log('✅ [PLAN CHECK] Plan details:', planResult.plan);
+        console.log('🔔 [PLAN CHECK] BANNER SHOULD APPEAR NOW!');
+        // Show plan for confirmation - add timestamp to force new object reference
+        setPendingPlan({
+          ...planResult.plan,
+          timestamp,
+        });
+        setOutput((prev) => [
+          ...prev,
+          '',
+          '═══════════════════════════════════════════',
+          '📋 PLAN CREATED - APPROVAL REQUIRED',
+          '═══════════════════════════════════════════',
+          '',
+          ...(planResult.plan.asciiPreview ? [
+            '📐 Preview:',
+            '',
+            ...planResult.plan.asciiPreview.split('\n').map((line: string) => `  ${line}`),
+            '',
+          ] : []),
+          `Summary: ${planResult.plan.summary}`,
+          '',
+          'Steps:',
+          ...planResult.plan.steps.map((step: string, i: number) => `  ${i + 1}. ${step}`),
+          '',
+          '═══════════════════════════════════════════',
+          '⚠️  WAITING FOR YOUR APPROVAL',
+          '═══════════════════════════════════════════',
+          '',
+          '👉 Use the buttons below OR type "yes"/"no"',
+          '',
+        ]);
+        // Add assistant's plan response to conversation history
+        setConversationHistory(prev => [...prev, { role: 'assistant', content: data.message }]);
+        return;
+      }
+      console.log('❌ No plan found, continuing normally');
+
+      // Add AI response to output
+      setOutput((prev) => [...prev, `   ${data.message}`]);
+
+      // Add assistant's response to conversation history
+      setConversationHistory(prev => [...prev, { role: 'assistant', content: data.message }]);
+
+      // Process tool results and update scene
+      if (data.toolResults && data.toolResults.length > 0) {
+        // Keep track of newly created nodes for line creation
+        const createdNodes = new Map<string, Node3D>();
+
+        // First pass: handle deletions
+        for (const result of data.toolResults) {
+          // Delete nodes (this also removes connected lines)
+          if (result.deletedNode) {
+            removeNode(result.deletedNode);
+          }
+          // Delete individual lines
+          if (result.deletedLine) {
+            removeLine(result.deletedLine);
+          }
+        }
+
+        // Second pass: handle moved nodes
+        for (const result of data.toolResults) {
+          if (result.movedNode) {
+            const existingNode = nodes.get(result.movedNode.name);
+            if (existingNode) {
+              existingNode.x = result.movedNode.newPosition.x;
+              existingNode.y = result.movedNode.newPosition.y;
+              existingNode.z = result.movedNode.newPosition.z;
+            }
+          }
+        }
+
+        // Third pass: create all nodes
+        for (const result of data.toolResults) {
+          if (result.node) {
+            const node = new Node3D(
+              result.node.name,
+              result.node.x,
+              result.node.y,
+              result.node.z
+            );
+            addNode(node);
+            createdNodes.set(node.name, node);
+          }
+        }
+
+        // Fourth pass: create all lines
+        for (const result of data.toolResults) {
+          if (result.line) {
+            // Look in both the existing nodes and newly created nodes
+            const n1 = nodes.get(result.line.node1) || createdNodes.get(result.line.node1);
+            const n2 = nodes.get(result.line.node2) || createdNodes.get(result.line.node2);
+
+            if (n1 && n2) {
+              const line = new Line3D(result.line.name, n1, n2);
+              addLine(line);
+            }
+          }
+        }
+
+        // Save to history after all changes
+        saveHistory();
+      }
+    } catch (error) {
+      // Check if the error is due to abort
+      if (error instanceof Error && error.name === 'AbortError') {
+        console.log('Request was aborted by user');
+        return; // Already handled in the stop button onClick
+      }
+      console.error('Error with AI:', error);
+      setOutput((prev) => [...prev, '   ✗ Sorry, I encountered an error. Please try again.']);
+    } finally {
+      setIsAIProcessing(false);
+    }
+  };
+
+  const handleCommand = async (command: string) => {
     const trimmed = command.trim();
     const lowerCommand = trimmed.toLowerCase();
 
+    // Handle plan approval/rejection
+    if (pendingPlan) {
+      if (lowerCommand === 'yes' || lowerCommand === 'approve' || lowerCommand === 'y' || lowerCommand === 'go ahead' || lowerCommand === 'proceed') {
+        console.log('✅ [APPROVAL] User approved plan with timestamp:', pendingPlan.timestamp);
+        setOutput((prev) => [...prev, `> ${command}`, '✓ Plan approved, executing...']);
+        console.log('🗑️ [APPROVAL] Clearing pendingPlan (setting to null)');
+        setPendingPlan(null);
+        // Send approval to AI to continue execution
+        await handleAIRequest('Yes, approved. Please proceed with the plan.');
+        return;
+      } else if (lowerCommand === 'no' || lowerCommand === 'reject' || lowerCommand === 'n' || lowerCommand === 'cancel') {
+        console.log('❌ [REJECTION] User rejected plan with timestamp:', pendingPlan.timestamp);
+        setOutput((prev) => [...prev, `> ${command}`, '✗ Plan rejected']);
+        console.log('🗑️ [REJECTION] Clearing pendingPlan (setting to null)');
+        setPendingPlan(null);
+        return;
+      }
+    }
+
+    // Check if this is a command or natural language
+    if (!isCommand(command)) {
+      // Send to AI
+      await handleAIRequest(command);
+      return;
+    }
+
+    // Otherwise execute as a command
     if (lowerCommand === 'help' || trimmed === '?') {
       setOutput((prev) => [
         ...prev,
         '─────── Available Commands ───────',
+        '',
+        'AI Assistant:',
+        '  Just type naturally! Examples:',
+        '    "create a cube 3x3"',
+        '    "make a pyramid with base 4m"',
+        '    "show me all nodes"',
         '',
         'Nodes:',
         '  N1[x,y,z]     - Create named node (e.g., N1[0,0,0])',
@@ -846,6 +1151,16 @@ export default function EditorPage() {
             ↷ Redo
           </button>
           <button
+            onClick={() => {
+              set2DMode(!is2DMode);
+              setOutput((prev) => [...prev, `✓ Switched to ${!is2DMode ? '2D' : '3D'} mode`]);
+            }}
+            className={`px-4 py-2 ${is2DMode ? 'bg-purple-600 hover:bg-purple-700' : 'bg-indigo-600 hover:bg-indigo-700'} text-white rounded transition-colors font-semibold`}
+            title={is2DMode ? 'Switch to 3D mode (X,Y,Z)' : 'Switch to 2D mode (Z=0)'}
+          >
+            {is2DMode ? '📐 2D' : '🧊 3D'}
+          </button>
+          <button
             onClick={handleLoadClick}
             className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded transition-colors"
           >
@@ -870,26 +1185,92 @@ export default function EditorPage() {
             {output.length === 0 ? (
               <div className="text-gray-500">
                 <p>Welcome to Craftea!</p>
-                <p className="mt-2">Type &apos;help&apos; to see all commands</p>
-                <p className="mt-4">Quick start:</p>
+                <p className="mt-2">Type commands or ask AI in natural language</p>
+                <p className="mt-4">Commands:</p>
                 <ul className="mt-2 space-y-1">
                   <li>• N1[0,0,0] - Create node</li>
                   <li>• L1[1,2] - Create line</li>
                   <li>• list - Show all</li>
                   <li>• help - Show commands</li>
                 </ul>
+                <p className="mt-4">Or ask AI:</p>
+                <ul className="mt-2 space-y-1">
+                  <li>• &quot;create a cube 3x3&quot;</li>
+                  <li>• &quot;make a pyramid&quot;</li>
+                  <li>• &quot;show me all nodes&quot;</li>
+                </ul>
               </div>
             ) : (
               output.map((line, i) => (
-                <div key={i} className="mb-1">
+                <div key={i} className="mb-1 whitespace-pre-wrap">
                   {line}
                 </div>
               ))
             )}
+            {isAIProcessing && (
+              <div className="mt-2 flex items-center gap-3">
+                <div className="text-blue-400 animate-pulse">
+                  🤖 AI is thinking...
+                </div>
+                <button
+                  onClick={() => {
+                    abortControllerRef.current?.abort();
+                    setIsAIProcessing(false);
+                    setOutput((prev) => [...prev, '✗ Request cancelled by user']);
+                  }}
+                  className="px-3 py-1 bg-red-600 hover:bg-red-700 text-white text-sm rounded transition-colors font-semibold"
+                  title="Stop the current AI request"
+                >
+                  ⏹ Stop
+                </button>
+              </div>
+            )}
+            {pendingPlan && (
+              <div key={pendingPlan.timestamp} className="mt-4 p-4 bg-gradient-to-r from-blue-900/40 to-purple-900/40 border-2 border-blue-500 rounded-lg shadow-lg animate-[fadeIn_0.3s_ease-in]">
+                <div className="flex items-center gap-2 mb-3">
+                  <span className="text-2xl">📋</span>
+                  <div className="text-blue-300 font-bold text-lg">Plan Ready for Approval</div>
+                  <span className="text-xs text-gray-500 ml-auto">#{pendingPlan.timestamp}</span>
+                </div>
+                <div className="text-gray-300 text-sm mb-4">
+                  Review the plan above and choose an action:
+                </div>
+                <div className="flex gap-3">
+                  <button
+                    data-action="approve"
+                    onClick={() => {
+                      console.log('🖱️ [BUTTON] Approve button clicked');
+                      handleCommand('yes');
+                    }}
+                    className="flex-1 px-4 py-3 bg-green-600 hover:bg-green-700 text-white font-semibold rounded-lg transition-all transform hover:scale-105 shadow-lg"
+                  >
+                    <div className="flex items-center justify-center gap-2">
+                      <span className="text-xl">✓</span>
+                      <span>Approve</span>
+                    </div>
+                    <div className="text-xs text-green-200 mt-1">Press Y or Enter</div>
+                  </button>
+                  <button
+                    data-action="reject"
+                    onClick={() => {
+                      console.log('🖱️ [BUTTON] Reject button clicked');
+                      handleCommand('no');
+                    }}
+                    className="flex-1 px-4 py-3 bg-red-600 hover:bg-red-700 text-white font-semibold rounded-lg transition-all transform hover:scale-105 shadow-lg"
+                  >
+                    <div className="flex items-center justify-center gap-2">
+                      <span className="text-xl">✗</span>
+                      <span>Reject</span>
+                    </div>
+                    <div className="text-xs text-red-200 mt-1">Press N or Esc</div>
+                  </button>
+                </div>
+              </div>
+            )}
           </div>
 
           <div className="p-4 border-t border-gray-700">
-            <CommandInput onCommand={handleCommand} />
+            <CommandInput onCommand={handleCommand} disabled={isAIProcessing} />
           </div>
         </div>
       </div>

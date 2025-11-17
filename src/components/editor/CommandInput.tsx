@@ -5,9 +5,10 @@ import { useState, useRef, useEffect } from 'react';
 interface CommandInputProps {
   onCommand: (command: string) => void;
   placeholder?: string;
+  disabled?: boolean;
 }
 
-export const CommandInput = ({ onCommand, placeholder = 'Enter command...' }: CommandInputProps) => {
+export const CommandInput = ({ onCommand, placeholder = 'Enter command or ask AI...', disabled = false }: CommandInputProps) => {
   const [input, setInput] = useState('');
   const [history, setHistory] = useState<string[]>([]);
   const [historyIndex, setHistoryIndex] = useState(-1);
@@ -20,7 +21,7 @@ export const CommandInput = ({ onCommand, placeholder = 'Enter command...' }: Co
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
 
-    if (!input.trim()) return;
+    if (!input.trim() || disabled) return;
 
     onCommand(input);
     setHistory((prev) => [...prev, input]);
@@ -64,7 +65,8 @@ export const CommandInput = ({ onCommand, placeholder = 'Enter command...' }: Co
         onChange={(e) => setInput(e.target.value)}
         onKeyDown={handleKeyDown}
         placeholder={placeholder}
-        className="w-full bg-gray-900 text-green-400 font-mono px-4 py-3 rounded border border-gray-700 focus:border-green-500 focus:outline-none"
+        disabled={disabled}
+        className="w-full bg-gray-900 text-green-400 font-mono px-4 py-3 rounded border border-gray-700 focus:border-green-500 focus:outline-none disabled:opacity-50 disabled:cursor-not-allowed"
       />
     </form>
   );

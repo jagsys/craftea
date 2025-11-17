@@ -1,6 +1,7 @@
 import { create } from 'zustand';
 import { Node3D, Line3D } from '@/lib/core/Node3D';
 import { Projection3D } from '@/lib/core/Projection3D';
+import { autoFixIntersections } from '@/lib/utils/intersectionDetector';
 
 interface HistoryState {
   nodes: Map<string, Node3D>;
@@ -17,6 +18,7 @@ interface EditorState {
   showAxisLabels: boolean;
   showNodes: boolean;
   showLineLabels: boolean;
+  is2DMode: boolean;
   history: HistoryState[];
   historyIndex: number;
   addNode: (node: Node3D) => void;
@@ -29,6 +31,7 @@ interface EditorState {
   setShowAxisLabels: (show: boolean) => void;
   setShowNodes: (show: boolean) => void;
   setShowLineLabels: (show: boolean) => void;
+  set2DMode: (is2D: boolean) => void;
   loadProject: (nodes: Node3D[], lines: Line3D[], projectInfo?: { id?: number; name: string }) => void;
   undo: () => void;
   redo: () => void;
@@ -47,6 +50,7 @@ export const useEditorStore = create<EditorState>((set, get) => ({
   showAxisLabels: true,
   showNodes: true,
   showLineLabels: true,
+  is2DMode: false,
   history: [{ nodes: new Map(), lines: new Map() }],
   historyIndex: 0,
 
@@ -96,9 +100,28 @@ export const useEditorStore = create<EditorState>((set, get) => ({
 
   addLine: (line) =>
     set((state) => {
-      const newLines = new Map(state.lines);
-      newLines.set(line.name, line);
-      return { lines: newLines };
+      try {
+        // Try automatic intersection detection
+        const result = autoFixIntersections(line, state.nodes, state.lines);
+
+        if (result) {
+          // Successfully detected and fixed intersections
+          return { nodes: result.nodes, lines: result.lines };
+        } else {
+          // Error in intersection detection, fall back to normal behavior
+          console.warn('Intersection detection failed, adding line without detection');
+          const newLines = new Map(state.lines);
+          newLines.set(line.name, line);
+          return { lines: newLines };
+        }
+      } catch (error) {
+        // Catch any unexpected errors
+        console.error('Error in addLine with intersection detection:', error);
+        // Fall back to normal behavior
+        const newLines = new Map(state.lines);
+        newLines.set(line.name, line);
+        return { lines: newLines };
+      }
     }),
 
   removeLine: (name) =>
@@ -129,6 +152,9 @@ export const useEditorStore = create<EditorState>((set, get) => ({
 
   setShowLineLabels: (show) =>
     set({ showLineLabels: show }),
+
+  set2DMode: (is2D) =>
+    set({ is2DMode: is2D }),
 
   loadProject: (nodes, lines, projectInfo) =>
     set((state) => {
